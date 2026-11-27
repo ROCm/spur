@@ -108,69 +108,183 @@ const SACCT_LONG_FORMAT: &str =
     "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
+/// `--format` names and their letters. Names can share a letter (`AllocCPUS` is
+/// `NCPUS`); the first name listed is that letter's header in the built-in layouts.
+const SACCT_FORMAT_FIELDS: &[(&str, char)] = &[
+    ("JobID", 'i'),
+    ("JobIDRaw", 'I'),
+    ("JobName", 'j'),
+    ("User", 'u'),
+    ("Account", 'a'),
+    ("Partition", 'P'),
+    ("State", 'T'),
+    ("Elapsed", 'M'),
+    ("ElapsedRaw", 'K'),
+    ("NNodes", 'D'),
+    ("ExitCode", 'x'),
+    ("DerivedExitCode", 'X'),
+    ("Start", 'S'),
+    ("End", 'E'),
+    ("Submit", 'V'),
+    ("TimeLimit", 'l'),
+    ("NodeList", 'n'),
+    ("NCPUS", 'C'),
+    ("AllocCPUS", 'C'),
+    ("ReqMem", 'R'),
+    ("QOS", 'Q'),
+    ("Reservation", 'v'),
+    ("PreemptedBy", 'y'),
+    ("PreemptMode", 'm'),
+    ("PreemptQOS", 'q'),
+    ("Borrowed", 'W'),
+    ("ReqGPUS", 'G'),
+    ("Reason", 'r'),
+    ("ReasonDetail", 'z'),
+    ("EndedBy", 'e'),
+];
+
 pub fn sacct_header(spec: char) -> &'static str {
-    match spec {
-        'i' => "JobID",
-        'j' => "JobName",
-        'u' => "User",
-        'a' => "Account",
-        'P' => "Partition",
-        'T' => "State",
-        't' => "State",
-        'M' => "Elapsed",
-        'D' => "NNodes",
-        'x' => "ExitCode",
-        'X' => "DerivedExitCode",
-        'S' => "Start",
-        'E' => "End",
-        'V' => "Submit",
-        'l' => "TimeLimit",
-        'n' => "NodeList",
-        'C' => "NCPUS",
-        'R' => "ReqMem",
-        'Q' => "QOS",
-        'y' => "PreemptedBy",
-        'm' => "PreemptMode",
-        'q' => "PreemptQOS",
-        'W' => "Borrowed",
-        'G' => "ReqGPUS",
-        'r' => "Reason",
-        'z' => "ReasonDetail",
-        'e' => "EndedBy",
-        _ => "?",
-    }
+    SACCT_FORMAT_FIELDS
+        .iter()
+        .find(|&&(_, field_spec)| field_spec == spec)
+        .map_or("?", |&(name, _)| name)
 }
 
-fn sacct_field_spec(name: &str) -> Option<char> {
-    match name.to_lowercase().as_str() {
-        "jobid" => Some('i'),
-        "jobname" => Some('j'),
-        "user" => Some('u'),
-        "account" => Some('a'),
-        "partition" => Some('P'),
-        "state" => Some('T'),
-        "elapsed" => Some('M'),
-        "nnodes" => Some('D'),
-        "exitcode" => Some('x'),
-        "derivedexitcode" => Some('X'),
-        "start" => Some('S'),
-        "end" => Some('E'),
-        "submit" => Some('V'),
-        "timelimit" => Some('l'),
-        "nodelist" => Some('n'),
-        "ncpus" => Some('C'),
-        "reqmem" => Some('R'),
-        "qos" => Some('Q'),
-        "preemptedby" => Some('y'),
-        "preemptmode" => Some('m'),
-        "preemptqos" => Some('q'),
-        "borrowed" => Some('W'),
-        "reqgpus" => Some('G'),
-        "reason" => Some('r'),
-        "reasondetail" => Some('z'),
-        "endedby" => Some('e'),
-        _ => None,
+/// Shared letter for every [`SLURM_ONLY_FORMAT_FIELDS`] name; it renders as `N/A`.
+const NOT_PROVIDED: char = '-';
+
+/// Slurm `sacct` fields Spur does not provide. They print as an `N/A` column under
+/// their Slurm name, so a Slurm script asking for one keeps its column positions.
+const SLURM_ONLY_FORMAT_FIELDS: &[&str] = &[
+    "AdminComment",
+    "AllocNodes",
+    "AllocTRES",
+    "AssocID",
+    "AveCPU",
+    "AveCPUFreq",
+    "AveDiskRead",
+    "AveDiskWrite",
+    "AvePages",
+    "AvePids",
+    "AveRSS",
+    "AveVMSize",
+    "Billing",
+    "BillingRaw",
+    "BlockID",
+    "Cluster",
+    "Comment",
+    "Constraints",
+    "ConsumedEnergy",
+    "ConsumedEnergyRaw",
+    "Container",
+    "CPUTime",
+    "CPUTimeRAW",
+    "DBIndex",
+    "Eligible",
+    "Exclusive",
+    "Extra",
+    "FailedNode",
+    "Flags",
+    "GID",
+    "Group",
+    "Layout",
+    "Licenses",
+    "MaxDiskRead",
+    "MaxDiskReadNode",
+    "MaxDiskReadTask",
+    "MaxDiskWrite",
+    "MaxDiskWriteNode",
+    "MaxDiskWriteTask",
+    "MaxPages",
+    "MaxPagesNode",
+    "MaxPagesTask",
+    "MaxPids",
+    "MaxPidsNode",
+    "MaxPidsTask",
+    "MaxRSS",
+    "MaxRSSNode",
+    "MaxRSSTask",
+    "MaxVMSize",
+    "MaxVMSizeNode",
+    "MaxVMSizeTask",
+    "McsLabel",
+    "MinCPU",
+    "MinCPUNode",
+    "MinCPUTask",
+    "NTasks",
+    "OriginalSLUID",
+    "OverSubscribe",
+    "Planned",
+    "PlannedCPU",
+    "PlannedCPURAW",
+    "Priority",
+    "QOSRAW",
+    "QOSREQ",
+    "ReqCPUFreq",
+    "ReqCPUFreqGov",
+    "ReqCPUFreqMax",
+    "ReqCPUFreqMin",
+    "ReqCPUS",
+    "ReqNodes",
+    "ReqTRES",
+    "ReservationId",
+    "ReqReservation",
+    "Restarts",
+    "SegmentSize",
+    "SLUID",
+    "SlurmRC",
+    "StdErr",
+    "StdIn",
+    "StdOut",
+    "SubmitLine",
+    "Suspended",
+    "SystemComment",
+    "SystemCPU",
+    "TimelimitRaw",
+    "TotalCPU",
+    "TRESUsageInAve",
+    "TRESUsageInMax",
+    "TRESUsageInMaxNode",
+    "TRESUsageInMaxTask",
+    "TRESUsageInMin",
+    "TRESUsageInMinNode",
+    "TRESUsageInMinTask",
+    "TRESUsageInTot",
+    "TRESUsageOutAve",
+    "TRESUsageOutMax",
+    "TRESUsageOutMaxNode",
+    "TRESUsageOutMaxTask",
+    "TRESUsageOutMin",
+    "TRESUsageOutMinNode",
+    "TRESUsageOutMinTask",
+    "TRESUsageOutTot",
+    "UID",
+    "UserCPU",
+    "WCKey",
+    "WCKeyID",
+    "WorkDir",
+];
+
+/// The letter and header for a `--format` name, matched in full and ignoring case.
+fn sacct_field(name: &str) -> Option<(char, &'static str)> {
+    if let Some(&(field, spec)) = SACCT_FORMAT_FIELDS
+        .iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
+    {
+        return Some((spec, field));
     }
+    SLURM_ONLY_FORMAT_FIELDS
+        .iter()
+        .find(|field| field.eq_ignore_ascii_case(name))
+        .map(|&field| (NOT_PROVIDED, field))
+}
+
+fn supported_format_fields() -> String {
+    SACCT_FORMAT_FIELDS
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub async fn main() -> Result<()> {
@@ -291,7 +405,8 @@ fn take_visible<T>(mut rows: Vec<T>, show: u32) -> (Vec<T>, bool) {
 fn output_fields(args: &SacctArgs) -> Result<Vec<format_engine::FormatToken>> {
     // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
     if let Some(ref f) = args.format {
-        let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
+        let fields = format_engine::parse_named_format_strict(f, &sacct_field)
+            .map_err(|e| anyhow::anyhow!("sacct: {e}\nSupported: {}", supported_format_fields()))?;
         if fields.is_empty() {
             anyhow::bail!("sacct: no recognized fields in --format='{f}'");
         }
@@ -323,12 +438,20 @@ fn render(
 fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
     match spec {
         'i' => job.job_id.to_string(),
+        // Slurm's JobID gains array and het suffixes (`123_4`); JobIDRaw never does.
+        'I' => job.job_id.to_string(),
         'j' => job.name.clone(),
         'u' => job.user.clone(),
         'a' => job.account.clone(),
         'P' => job.partition.clone(),
-        'T' | 't' => state_name(job.state),
+        'T' => state_name(job.state),
         'M' => format_elapsed(job),
+        // The magnitude, as Elapsed prints it, so the two never disagree.
+        'K' => job
+            .run_time
+            .as_ref()
+            .map_or(0, |rt| rt.seconds.unsigned_abs())
+            .to_string(),
         'D' => job.num_nodes.to_string(),
         'x' => format_exit(job.exit_code, job.exit_signal),
         'X' => format_exit(job.derived_exit_code, 0),
@@ -342,6 +465,8 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'n' => job.nodelist.clone(),
         'C' => ncpus(job).to_string(),
         'Q' => job.qos.clone(),
+        // Blank without a reservation, as in Slurm and squeue's %v.
+        'v' => job.reservation.clone(),
         'y' => {
             if job.preempted_by == 0 {
                 "N/A".into()
@@ -389,6 +514,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
                 job.ended_by.clone()
             }
         }
+        NOT_PROVIDED => "N/A".into(),
         _ => "?".into(),
     }
 }
@@ -547,9 +673,6 @@ mod tests {
 
     #[test]
     fn reqmem_renders_suffixed_matching_scontrol() {
-        // Regression: this field was registered in the header and name tables but had no
-        // resolver, so `sacct --format=ReqMem` printed "?". Found by the three-way
-        // registration test below.
         let mut j = job(0, 0, 0);
         assert_eq!(resolve_sacct_field(&j, 'R'), "0");
         j.min_memory_node_mb = 16000;
@@ -623,48 +746,14 @@ mod tests {
 
     #[test]
     fn every_named_field_resolves_to_a_header_and_a_value() {
-        // A field is only usable when all three registrations agree: the name -> letter
-        // lookup, the letter -> header name, and the letter -> value resolver. Half-
-        // registering one is silent, and shipped documentation once described a field
-        // that had a column and a header but no resolver, so this walks the whole set.
-        let names = [
-            "jobid",
-            "jobname",
-            "user",
-            "account",
-            "partition",
-            "state",
-            "elapsed",
-            "nnodes",
-            "exitcode",
-            "derivedexitcode",
-            "start",
-            "end",
-            "submit",
-            "timelimit",
-            "nodelist",
-            "ncpus",
-            "reqmem",
-            "qos",
-            "preemptedby",
-            "preemptmode",
-            "preemptqos",
-            "borrowed",
-            "reason",
-            "reasondetail",
-            "endedby",
-            "reqgpus",
-        ];
+        // A letter in the table without a resolver arm renders "?" and nothing else
+        // notices, so this walks the whole table.
         let job = JobInfo::default();
-        for name in names {
-            let spec = sacct_field_spec(name).unwrap_or_else(|| panic!("{name} has no field spec"));
-            assert_ne!(
-                sacct_header(spec),
-                "?",
-                "{name} maps to '{spec}' which has no header name"
-            );
-            // An unresolved letter falls through to "?", so this catches a letter that
-            // was added to the tables but never given a value.
+        for (name, expected_spec) in SACCT_FORMAT_FIELDS {
+            let (spec, header) =
+                sacct_field(name).unwrap_or_else(|| panic!("{name} has no field spec"));
+            assert_eq!(spec, *expected_spec, "{name}");
+            assert_eq!(header, *name);
             assert_ne!(
                 resolve_sacct_field(&job, spec),
                 "?",
@@ -674,21 +763,123 @@ mod tests {
     }
 
     #[test]
-    fn sacct_field_spec_is_case_insensitive_and_rejects_unknown_names() {
+    fn sacct_field_is_case_insensitive_and_rejects_unknown_names() {
         for name in ["JobID", "jobid", "JOBID"] {
-            assert_eq!(sacct_field_spec(name), Some('i'));
+            assert_eq!(sacct_field(name), Some(('i', "JobID")));
         }
-        assert_eq!(sacct_field_spec("NotAField"), None);
+        assert_eq!(sacct_field("maxrss"), Some((NOT_PROVIDED, "MaxRSS")));
+        assert_eq!(sacct_field("NotAField"), None);
+    }
+
+    #[test]
+    fn no_slurm_only_field_is_one_spur_provides() {
+        for name in SLURM_ONLY_FORMAT_FIELDS {
+            assert!(
+                !SACCT_FORMAT_FIELDS
+                    .iter()
+                    .any(|(field, _)| field.eq_ignore_ascii_case(name)),
+                "{name} is in both field tables"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slurm_field_spur_does_not_provide_is_an_na_column_under_its_slurm_name() {
+        let args = SacctArgs::try_parse_from(["sacct", "-P", "--format=JobID,maxrss,AllocTRES%10"])
+            .unwrap();
+        let fields = output_fields(&args).unwrap();
+        let ran = JobInfo {
+            job_id: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            render(args.output_style(), &fields, &[ran]),
+            ["JobID|MaxRSS|AllocTRES", "7|N/A|N/A"]
+        );
+    }
+
+    #[test]
+    fn alloc_cpus_is_ncpus_under_its_own_header() {
+        let args = SacctArgs::try_parse_from(["sacct", "-P", "--format=NCPUS,AllocCPUS"]).unwrap();
+        let fields = output_fields(&args).unwrap();
+        let ran = JobInfo {
+            alloc_cpus: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            render(args.output_style(), &fields, &[ran]),
+            ["NCPUS|AllocCPUS", "16|16"]
+        );
+    }
+
+    #[test]
+    fn raw_fields_print_the_bare_id_and_elapsed_seconds() {
+        let args = SacctArgs::try_parse_from([
+            "sacct",
+            "-P",
+            "--format=JobID,JobIDRaw,Elapsed,ElapsedRaw",
+        ])
+        .unwrap();
+        let fields = output_fields(&args).unwrap();
+        let ran = JobInfo {
+            job_id: 42,
+            run_time: Some(prost_types::Duration {
+                seconds: 3725,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let never_started = JobInfo {
+            job_id: 43,
+            ..Default::default()
+        };
+        assert_eq!(
+            render(args.output_style(), &fields, &[ran, never_started]),
+            [
+                "JobID|JobIDRaw|Elapsed|ElapsedRaw",
+                "42|42|01:02:05|3725",
+                "43|43|00:00:00|0"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_built_in_layout_letter_has_a_header() {
+        let layouts: [&[&str]; 3] = [&[], &["-l"], &["-b"]];
+        for flags in layouts {
+            let args =
+                SacctArgs::try_parse_from(std::iter::once("sacct").chain(flags.iter().copied()))
+                    .unwrap();
+            for token in output_fields(&args).unwrap() {
+                if let format_engine::FormatToken::Field(field) = token {
+                    assert_ne!(field.header, "?", "{flags:?} uses '{}'", field.spec);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_letter_takes_the_first_listed_name_as_its_header() {
+        assert_eq!(sacct_header('C'), "NCPUS");
+        assert_eq!(sacct_header('?'), "?");
+    }
+
+    #[test]
+    fn reservation_prints_the_recorded_name_or_nothing() {
+        let reserved = JobInfo {
+            reservation: "maint".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_sacct_field(&reserved, 'v'), "maint");
+        assert_eq!(resolve_sacct_field(&JobInfo::default(), 'v'), "");
     }
 
     #[test]
     fn custom_format_comma_separated_names_populate_requested_columns() {
         // Real Slurm's sacct --format syntax; used to produce blank columns.
-        let fields = format_engine::parse_named_format(
-            "JobID,JobName,Partition,State",
-            &sacct_field_spec,
-            &sacct_header,
-        );
+        let fields =
+            format_engine::parse_named_format_strict("JobID,JobName,Partition,State", &sacct_field)
+                .unwrap();
         let field_count = fields
             .iter()
             .filter(|t| matches!(t, format_engine::FormatToken::Field(_)))
@@ -705,11 +896,8 @@ mod tests {
     }
 
     fn coco_fields() -> Vec<format_engine::FormatToken> {
-        format_engine::parse_named_format(
-            "JobID,State,ExitCode,NodeList",
-            &sacct_field_spec,
-            &sacct_header,
-        )
+        format_engine::parse_named_format_strict("JobID,State,ExitCode,NodeList", &sacct_field)
+            .unwrap()
     }
 
     fn history() -> Vec<JobInfo> {
@@ -783,15 +971,55 @@ mod tests {
         assert!(lines[1].starts_with("-----"), "{lines:?}");
     }
 
-    #[tokio::test]
-    async fn format_with_no_recognized_fields_fails_fast() {
-        // Errors before ever connecting, so no server/network is needed here.
-        let err = main_with_args(vec![
-            "sacct".into(),
-            "--format=NotAField,AlsoNotAField".into(),
-        ])
-        .await
-        .unwrap_err();
+    #[test]
+    fn format_with_only_unknown_fields_names_the_first() {
+        let args =
+            SacctArgs::try_parse_from(["sacct", "--format=NotAField,AlsoNotAField"]).unwrap();
+        let message = output_fields(&args).unwrap_err().to_string();
+        assert!(
+            message.starts_with("sacct: Invalid field requested: NotAField\nSupported: "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn format_with_one_unknown_field_names_it_and_lists_the_supported_ones() {
+        let args = SacctArgs::try_parse_from(["sacct", "--format=JobID,Bogus"]).unwrap();
+        let message = output_fields(&args).unwrap_err().to_string();
+        assert!(
+            message.starts_with("sacct: Invalid field requested: Bogus\nSupported: JobID, "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_with_a_width_reports_the_name_only() {
+        let args = SacctArgs::try_parse_from(["sacct", "--format=JobID,Bogus%10"]).unwrap();
+        let message = output_fields(&args).unwrap_err().to_string();
+        assert!(
+            message.starts_with("sacct: Invalid field requested: Bogus\n"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_width_suffix_does_not_make_a_known_field_unknown() {
+        let args = SacctArgs::try_parse_from(["sacct", "--format=JobName%20,JobID%-8"]).unwrap();
+        let fields = output_fields(&args).unwrap();
+        let specs: Vec<char> = fields
+            .iter()
+            .filter_map(|token| match token {
+                format_engine::FormatToken::Field(field) => Some(field.spec),
+                format_engine::FormatToken::Literal(_) => None,
+            })
+            .collect();
+        assert_eq!(specs, vec!['j', 'i']);
+    }
+
+    #[test]
+    fn format_with_only_commas_still_errors() {
+        let args = SacctArgs::try_parse_from(["sacct", "--format=,,,"]).unwrap();
+        let err = output_fields(&args).unwrap_err();
         assert!(err.to_string().contains("no recognized fields"));
     }
 

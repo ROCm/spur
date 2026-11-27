@@ -135,12 +135,38 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
 }
 
 /// Parse sacct/sreport-style comma-separated field names, unlike squeue/sinfo's `%`-specifiers.
+/// An unknown name is skipped. [`parse_named_format_strict`] reports it instead.
 pub fn parse_named_format(
     fmt: &str,
     name_to_spec: &dyn Fn(&str) -> Option<char>,
     header_map: &dyn Fn(char) -> &'static str,
 ) -> Vec<FormatToken> {
+    parse_named_items(fmt, &|name| {
+        name_to_spec(name).map(|spec| (spec, header_map(spec)))
+    })
+    .0
+}
+
+/// [`parse_named_format`], but the first unknown name is `Invalid field requested: {name}`.
+/// `field` maps a name to its letter and header, so several names can share one letter.
+pub fn parse_named_format_strict(
+    fmt: &str,
+    field: &dyn Fn(&str) -> Option<(char, &'static str)>,
+) -> anyhow::Result<Vec<FormatToken>> {
+    let (tokens, first_unknown) = parse_named_items(fmt, field);
+    if let Some(name) = first_unknown {
+        anyhow::bail!("Invalid field requested: {name}");
+    }
+    Ok(tokens)
+}
+
+/// The tokens for the known names, and the first unknown name.
+fn parse_named_items<'a>(
+    fmt: &'a str,
+    field: &dyn Fn(&str) -> Option<(char, &'static str)>,
+) -> (Vec<FormatToken>, Option<&'a str>) {
     let mut tokens = Vec::new();
+    let mut first_unknown = None;
     let items: Vec<&str> = fmt.split(',').collect();
     for (i, item) in items.iter().enumerate() {
         let item = item.trim();
@@ -151,7 +177,10 @@ pub fn parse_named_format(
             Some((n, w)) => (n.trim(), w.trim().parse::<i32>().unwrap_or(0)),
             None => (item, 0),
         };
-        let Some(spec) = name_to_spec(name) else {
+        let Some((spec, header)) = field(name) else {
+            // A bare `%width` has no name; report the token the user typed.
+            let typed = if name.is_empty() { item } else { name };
+            first_unknown = first_unknown.or(Some(typed));
             continue;
         };
         let abs_width = width.unsigned_abs() as usize;
@@ -160,13 +189,13 @@ pub fn parse_named_format(
             width: abs_width,
             right_align: width >= 0,
             truncate: if abs_width > 0 { Some(abs_width) } else { None },
-            header: header_map(spec).to_string(),
+            header: header.to_string(),
         }));
         if i + 1 < items.len() {
             tokens.push(FormatToken::Literal(" ".to_string()));
         }
     }
-    tokens
+    (tokens, first_unknown)
 }
 
 /// Parse Slurm's `-O`/`--Format` grammar: a comma-separated list of fields, each
@@ -177,7 +206,7 @@ pub fn parse_named_format(
 /// Unlike [`parse_named_format`] (sacct's `Name%width` form), fields are not
 /// separated by an implicit space — Slurm relies on width padding — so callers
 /// add separators via the suffix if they want them. An unrecognized field name
-/// is an error rather than being silently dropped.
+/// is an error, as in [`parse_named_format_strict`], rather than being silently dropped.
 pub fn parse_format2(
     fmt: &str,
     name_to_spec: &dyn Fn(&str) -> Option<char>,
@@ -665,6 +694,56 @@ mod tests {
             .filter(|t| matches!(t, FormatToken::Field(_)))
             .count();
         assert_eq!(field_count, 2);
+    }
+
+    fn test_field(name: &str) -> Option<(char, &'static str)> {
+        test_name_to_spec(name).map(|spec| (spec, squeue_header(spec)))
+    }
+
+    #[test]
+    fn parse_named_format_strict_names_an_unknown_field() {
+        let err = parse_named_format_strict("JobID,NotAField,Partition", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: NotAField");
+    }
+
+    #[test]
+    fn parse_named_format_strict_names_a_bare_width() {
+        let err = parse_named_format_strict("%20", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: %20");
+    }
+
+    #[test]
+    fn parse_named_format_strict_strips_a_width_from_an_unknown_field() {
+        let err = parse_named_format_strict("NotAField%10", &test_field).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid field requested: NotAField");
+    }
+
+    #[test]
+    fn parse_named_format_strict_takes_each_header_from_the_lookup() {
+        let shared = |name: &str| match name {
+            "First" => Some(('-', "First")),
+            "Second" => Some(('-', "Second")),
+            _ => None,
+        };
+        let tokens = parse_named_format_strict("First,Second", &shared).unwrap();
+        let headers: Vec<&str> = only_fields(&tokens)
+            .iter()
+            .map(|field| field.header.as_str())
+            .collect();
+        assert_eq!(headers, ["First", "Second"]);
+    }
+
+    #[test]
+    fn parse_named_format_strict_keeps_a_width_on_a_known_field() {
+        let tokens = parse_named_format_strict("JobName%20,JobID%-8", &test_field).unwrap();
+        let fields = only_fields(&tokens);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].spec, 'j');
+        assert_eq!(fields[0].width, 20);
+        assert!(fields[0].right_align);
+        assert_eq!(fields[1].spec, 'i');
+        assert_eq!(fields[1].width, 8);
+        assert!(!fields[1].right_align);
     }
 
     #[test]

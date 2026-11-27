@@ -104,6 +104,14 @@ is forwarded to the accounting DB as a `WHERE job_id IN (...)` predicate.
 caller may read, so `-a` only matters against `-u`; the last of `-a`/`-u` wins,
 as in Slurm.
 
+**sacct --format** takes comma-separated field names (`JobID,State`), not `%`
+letters, with an optional width (`JobName%20`, `JobID%-8`). A Slurm field Spur
+does not provide (`SLURM_ONLY_FORMAT_FIELDS` in `sacct.rs`, e.g. `AllocTRES`,
+`MaxRSS`) prints as an `N/A` column under its Slurm name. As in Slurm, a name
+Slurm does not know either fails with `Invalid field requested: <name>` and
+exit 1. Unlike Slurm, names must be spelled in full (Slurm takes the prefix
+`JobN` and the keyword `ALL`).
+
 **scontrol show assoc_mgr** uses a simplified layout. Filters to one user
 (`users=<name>`); Slurm's `accounts=`, `qos=`, and `flags=` selectors are not
 accepted.
