@@ -1466,6 +1466,7 @@ async fn run_completion_hooks_and_report(
                 step_id: None,
                 node_token: node_token.to_string(),
                 pty_step_id: None,
+                launch_failure: None,
             },
         )
         .await;
@@ -2451,6 +2452,7 @@ pub(crate) fn monitor_recovered_stepds(
                         step_id: Some(completion.step_id),
                         node_token: reporter.node_token(),
                         pty_step_id: completion.pty_step_id,
+                        launch_failure: None,
                     },
                 )
                 .await
@@ -2733,6 +2735,115 @@ fn settle_lost_teardown(
     }
 }
 
+/// A real workload exit wins, so a failure file cannot relabel a script that
+/// ran; with only an invented exit or none, the failure file is the outcome.
+fn completion_for_dead_supervisor(
+    recorded_exit: Option<(i32, i32)>,
+    exit_was_synthesized: bool,
+    launch_failure: Option<String>,
+) -> (i32, i32, Option<String>) {
+    if let Some((code, signal)) = recorded_exit.filter(|_| !exit_was_synthesized) {
+        return (code, signal, None);
+    }
+    if launch_failure.is_some() {
+        return (1, 0, launch_failure);
+    }
+    match recorded_exit {
+        Some((code, signal)) => (code, signal, None),
+        None => (0, nix::sys::signal::Signal::SIGKILL as i32, None),
+    }
+}
+
+#[cfg(test)]
+mod dead_supervisor_completion {
+    use super::completion_for_dead_supervisor;
+
+    #[test]
+    fn a_synthesized_kill_keeps_a_recorded_launch_failure() {
+        let (code, signal, reason) = completion_for_dead_supervisor(
+            Some((0, 9)),
+            true,
+            Some("open stdout: permission denied".into()),
+        );
+        assert_eq!((code, signal), (1, 0));
+        assert_eq!(reason.as_deref(), Some("open stdout: permission denied"));
+    }
+
+    #[test]
+    fn a_real_exit_is_not_relabeled_when_a_failure_file_exists() {
+        let (code, signal, reason) =
+            completion_for_dead_supervisor(Some((1, 0)), false, Some("supervisor polling".into()));
+        assert_eq!((code, signal), (1, 0));
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn a_death_with_no_record_stays_a_kill() {
+        let (code, signal, reason) = completion_for_dead_supervisor(None, false, None);
+        assert_eq!((code, signal), (0, 9));
+        assert!(reason.is_none());
+    }
+
+    fn dead_supervisor_outcome(
+        store: &crate::stepd::StepdStore,
+        error: &crate::executor::LaunchError,
+    ) -> (i32, i32, Option<String>) {
+        let session_dir = store
+            .prepare_session_dir(46, 1, spur_core::step::STEP_BATCH)
+            .expect("prepare session directory");
+        crate::stepd::record_executor_failure(&session_dir, "", 0, 0, error);
+        let launch_failure = store.launch_failure(46, 1, spur_core::step::STEP_BATCH);
+        completion_for_dead_supervisor(None, false, launch_failure)
+    }
+
+    #[tokio::test]
+    async fn a_script_that_ran_before_a_post_spawn_error_is_not_a_launch_failure() {
+        use tokio::io::AsyncReadExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("script-ran");
+        let cgroup = temp.path().join("cgroup");
+        std::fs::create_dir(&cgroup).expect("create cgroup directory");
+        std::fs::write(cgroup.join("cgroup.procs"), b"").expect("write cgroup.procs");
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("touch '{}'", marker.display()))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the script");
+        // EOF on stdout means the script exited; it stays unreaped, as in the race.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        stdout
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect("read stdout");
+        assert!(marker.exists(), "the script must have run");
+
+        let error =
+            crate::executor::refuse_unjoined_workload(true, Some(cgroup.as_path()), &mut child)
+                .await
+                .expect_err("an exited script is not in its cgroup");
+        let store = crate::stepd::StepdStore::new(temp.path().join("state"));
+        let (code, signal, reason) = dead_supervisor_outcome(&store, &error);
+
+        assert!(error.workload_spawned());
+        assert_eq!((code, signal), (0, 9));
+        assert!(reason.is_none(), "reported as a launch failure: {reason:?}");
+    }
+
+    #[test]
+    fn an_error_before_spawn_is_still_a_launch_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = crate::stepd::StepdStore::new(temp.path());
+        let error = crate::executor::LaunchError::Other(anyhow::anyhow!("open stdout: denied"));
+
+        let (code, signal, reason) = dead_supervisor_outcome(&store, &error);
+
+        assert_eq!((code, signal), (1, 0));
+        assert_eq!(reason.as_deref(), Some("open stdout: denied"));
+    }
+}
+
 async fn fence_dead_stepd(
     context: &CompletionListenerContext,
     descriptor: crate::stepd::StepdDescriptor,
@@ -2770,14 +2881,22 @@ async fn fence_dead_stepd(
         )
         .ok()
         .flatten();
-    let (exit_code, signal) =
-        recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
-    if recorded_exit.is_none() {
-        if let Some(reason) = store.recorded_failure(
+    let exit_was_synthesized = store
+        .observed_exit_was_synthesized(
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
-        ) {
+        )
+        .unwrap_or(false);
+    let recorded_failure = store.launch_failure(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    );
+    let (exit_code, signal, launch_failure) =
+        completion_for_dead_supervisor(recorded_exit, exit_was_synthesized, recorded_failure);
+    if recorded_exit.is_none() {
+        if let Some(reason) = &launch_failure {
             warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %reason,
                 "stepd recorded why its launch failed before dying");
         }
@@ -2807,6 +2926,7 @@ async fn fence_dead_stepd(
             step_id: Some(descriptor.step_id),
             node_token: reporter.node_token(),
             pty_step_id: descriptor.pty_step_id,
+            launch_failure,
         },
     )
     .await;
@@ -2967,6 +3087,7 @@ async fn handle_completion_notification(
                     step_id: Some(step_id),
                     node_token: context.reporter.node_token(),
                     pty_step_id: descriptor.pty_step_id,
+                    launch_failure: None,
                 },
             )
             .await;
@@ -3062,19 +3183,37 @@ async fn replay_runtime_completions(
                 .epilog_failed
                 .then(|| drain_for(EPILOG_FAILED_DRAIN_REASON)),
         };
+        let recorded_failure = store.launch_failure(
+            completion.job_id,
+            completion.run_attempt,
+            completion.step_id,
+        );
+        let exit_was_synthesized = store
+            .observed_exit_was_synthesized(
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+            )
+            .unwrap_or(false);
+        let (exit_code, signal, launch_failure) = completion_for_dead_supervisor(
+            Some((completion.exit_code, completion.signal)),
+            exit_was_synthesized,
+            recorded_failure,
+        );
         if report_runtime_completion(
             store,
             controller_addr,
             CompletionReport {
                 job_id: completion.job_id,
-                exit_code: completion.exit_code,
-                signal: completion.signal,
+                exit_code,
+                signal,
                 run_attempt: completion.run_attempt,
                 reporting_node,
                 drain: drain.as_ref(),
                 step_id: Some(completion.step_id),
                 node_token: node_token.to_string(),
                 pty_step_id: completion.pty_step_id,
+                launch_failure,
             },
         )
         .await
@@ -3200,6 +3339,7 @@ async fn report_orphan_cleanup_completion(
             drain: None,
             node_token: node_token.to_owned(),
             pty_step_id: None,
+            launch_failure: None,
         },
     )
     .await
@@ -6700,6 +6840,8 @@ pub(crate) struct CompletionReport<'a> {
     pub node_token: String,
     /// See [`crate::stepd::StepdDescriptor::pty_step_id`].
     pub pty_step_id: Option<spur_core::step::StepId>,
+    /// The supervisor's reason when it died before the batch script started.
+    pub launch_failure: Option<String>,
 }
 
 pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
@@ -6713,15 +6855,21 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         step_id,
         node_token,
         pty_step_id,
+        launch_failure,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
+    let message = match &launch_failure {
+        Some(reason) => spur_core::end_reason::format_launch_failure_message(reason),
+        None => format!("exit_code={exit_code}"),
+    };
 
     let result = retry_controller_rpc(move |attempt| {
         let node_token = node_token.clone();
+        let message = message.clone();
         async move {
             let channel = spur_client::connect_channel(controller_addr)
                 .await
@@ -6743,7 +6891,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 state,
                 exit_code,
                 signal,
-                message: format!("exit_code={}", exit_code),
+                message,
                 drain_node: drain.is_some(),
                 drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
                 reporting_node: reporting_node.to_string(),

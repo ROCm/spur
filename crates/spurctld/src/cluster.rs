@@ -937,6 +937,8 @@ struct NodeExit<'a> {
     run_attempt: u32,
     /// Sent as `JobCopyExited`, the only report that ends a per-node run copy by copy.
     copy_exit: bool,
+    /// The supervisor's reason for dying before the batch script started, if it did.
+    launch_detail: Option<&'a str>,
 }
 
 /// What applying a [`NodeExit`] did beyond its job: the slices it returned, the
@@ -3388,6 +3390,27 @@ impl ClusterManager {
         signal: i32,
         run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
+        self.node_complete_with_launch_detail(
+            job_id,
+            node_name,
+            exit_code,
+            signal,
+            run_attempt,
+            None,
+        )
+    }
+
+    /// As [`Self::node_complete`], plus the supervisor's own reason when it died
+    /// before the batch script started. `None` for a script that ran.
+    pub(crate) fn node_complete_with_launch_detail(
+        &self,
+        job_id: JobId,
+        node_name: &str,
+        exit_code: i32,
+        signal: i32,
+        run_attempt: u32,
+        launch_detail: Option<String>,
+    ) -> Result<NodeCompleteResult, NodeCompleteError> {
         let copy_exit = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3455,6 +3478,7 @@ impl ClusterManager {
                 signal,
                 run_attempt,
                 at: None,
+                launch_detail,
             }
         };
         let resp = self
@@ -9215,6 +9239,13 @@ impl ClusterManager {
                 signal: exit.signal,
             },
         );
+        // Only the batch script's node. A companion that failed to launch must not
+        // relabel a script that ran on the primary.
+        if job.allocated_nodes.first().map(String::as_str) == Some(exit.node) {
+            if let Some(detail) = exit.launch_detail.filter(|d| !d.is_empty()) {
+                job.launch_failure_detail = Some(detail.to_string());
+            }
+        }
 
         let others_run_on = in_grace || (per_node && job.first_failed_node.is_none());
         let released = if per_node && others_run_on && !job.all_nodes_completed() {
@@ -10129,12 +10160,17 @@ impl ClusterManager {
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
+                let launch_detail = match op {
+                    WalOperation::JobNodeComplete { launch_detail, .. } => launch_detail.as_deref(),
+                    _ => None,
+                };
                 let exit = NodeExit {
                     node: node_name,
                     exit_code: *exit_code,
                     signal: *signal,
                     run_attempt: *run_attempt,
                     copy_exit: matches!(op, WalOperation::JobCopyExited { .. }),
+                    launch_detail,
                 };
                 let effect =
                     Self::apply_node_exit(job, &mut nodes, &self.steps.read(), &exit, timestamp);
@@ -19828,6 +19864,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -19911,6 +19948,7 @@ state = "UP"
             signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::OutOfMemory);
         assert_eq!(
@@ -20533,6 +20571,7 @@ state = "UP"
             signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -20583,6 +20622,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
@@ -20597,6 +20637,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
@@ -20607,6 +20648,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -20689,6 +20731,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
@@ -20759,6 +20802,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let swept = cm
@@ -20830,6 +20874,7 @@ state = "UP"
             signal: 9,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!((job.derived_exit_code, job.exit_signal), (5, 9));
@@ -20933,6 +20978,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         assert!(r1.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
@@ -20944,6 +20990,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         let f = r2
             .jobs_finalized
@@ -21088,6 +21135,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
@@ -21807,6 +21855,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -21832,6 +21881,7 @@ state = "UP"
                 signal: 0,
                 run_attempt: 0,
                 at: None,
+                launch_detail: None,
             });
         }
 
@@ -21890,6 +21940,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         cm.cancel_job(1, "testuser").unwrap();
@@ -22087,6 +22138,7 @@ state = "UP"
             signal: 15,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -22219,6 +22271,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let job = cm.get_job(job_id).unwrap();
@@ -22384,6 +22437,7 @@ state = "UP"
             signal: 11,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -22391,6 +22445,37 @@ state = "UP"
         assert_eq!(
             fin.reason_detail.as_deref(),
             Some("signal 11 (Segmentation_fault)")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_died_before_the_script_records_the_launch_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "never-started", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 1,
+            signal: 0,
+            run_attempt: 0,
+            at: None,
+            launch_detail: Some("open stdout: permission denied".into()),
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.state, JobState::Failed);
+        assert_eq!(fin.reason, EndReason::JobLaunchFailure);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some("open stdout: permission denied")
+        );
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (open stdout: permission denied)"
         );
     }
 
@@ -22595,6 +22680,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id,
@@ -22603,6 +22689,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -22704,6 +22791,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         let job = cm.get_job(job_id).unwrap();
@@ -22905,6 +22993,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         };
 
         cm.apply_operation(&node_report(3));
@@ -23309,6 +23398,7 @@ state = "UP"
                 signal: 0,
                 run_attempt: 0,
                 copy_exit,
+                launch_detail: None,
             }
         }
 
@@ -23347,6 +23437,27 @@ state = "UP"
             assert_eq!(effect.released, ["n1", "n2"]);
             assert_eq!(effect.finalized.map(|f| f.state), Some(JobState::Completed));
             assert_eq!((charged(&nodes, "n1"), charged(&nodes, "n2")), (0, 0));
+        }
+
+        #[test]
+        fn only_the_batch_node_can_name_a_launch_failure() {
+            let (mut job, mut nodes) = per_node_run(&["n1", "n2"]);
+            let companion = NodeExit {
+                launch_detail: Some("pivot_root failed"),
+                ..exit("n2", 1, false)
+            };
+            apply(&mut job, &mut nodes, &Steps::new(), companion);
+            assert!(job.launch_failure_detail.is_none());
+
+            let batch = NodeExit {
+                launch_detail: Some("pivot_root failed"),
+                ..exit("n1", 1, false)
+            };
+            apply(&mut job, &mut nodes, &Steps::new(), batch);
+            assert_eq!(
+                job.launch_failure_detail.as_deref(),
+                Some("pivot_root failed")
+            );
         }
 
         #[test]
@@ -23456,6 +23567,7 @@ state = "UP"
             signal: 0,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
 
         assert_eq!(resp.jobs_finalized[0].reason, EndReason::None);
@@ -23517,6 +23629,7 @@ state = "UP"
                 signal,
                 run_attempt: 0,
                 at: None,
+                launch_detail: None,
             });
 
             assert_eq!(resp.jobs_finalized[0].reason, expected, "signal {signal}");
@@ -25325,6 +25438,7 @@ state = "UP"
             signal: 15,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         });
         assert_eq!(done.jobs_finalized.len(), 1);
         assert_eq!(done.jobs_finalized[0].state, JobState::Preempted);
@@ -26181,6 +26295,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -38825,6 +38940,7 @@ state = "UP"
             signal: 0,
             at: Some(at),
             run_attempt: 0,
+            launch_detail: None,
         });
         cm.run_all_finalized_side_effects(&resp);
         resp
@@ -40237,6 +40353,7 @@ state = "UP"
                 signal: 9 | spur_core::job::OOM_SIGNAL_FLAG,
                 at: Some(grace_exit_at()),
                 run_attempt: 0,
+                launch_detail: None,
             });
             cm.run_all_finalized_side_effects(&resp);
 
@@ -42467,6 +42584,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
         settle(&cm, job_a, JobState::Completing);
         assert_eq!(
@@ -46569,6 +46687,7 @@ state = "UP"
             signal: 0,
             at: None,
             run_attempt: 0,
+            launch_detail: None,
         });
 
         let node = cm.get_node("n1").unwrap();

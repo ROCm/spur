@@ -133,6 +133,10 @@ pub enum WalOperation {
         run_attempt: u32,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Set when this node accepted the job and its supervisor died before
+        /// the batch script started. Absent on older log entries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_detail: Option<String>,
     },
     /// The time-limit watchdog signalled a running job for exhausting its wall
     /// clock. Durable so the grace period survives a leadership change and so
@@ -1540,6 +1544,7 @@ mod tests {
             signal: 9,
             run_attempt: 0,
             at: None,
+            launch_detail: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1591,6 +1596,25 @@ mod tests {
                 (job_id, node_name.as_str(), exit_code, run_attempt),
                 (7, "n2", 3, 2)
             ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_node_complete_without_launch_detail_still_deserializes() {
+        const OLD: &str =
+            r#"{"JobNodeComplete":{"job_id":1,"node_name":"n0","exit_code":0,"signal":9}}"#;
+        let op: WalOperation = serde_json::from_str(OLD)
+            .expect("a log entry from before launch_detail must still replay");
+        match op {
+            WalOperation::JobNodeComplete {
+                signal,
+                launch_detail,
+                ..
+            } => {
+                assert_eq!(signal, 9);
+                assert!(launch_detail.is_none());
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -964,6 +964,7 @@ fn node_inventory_apply_ignores_replica_local_gpu_accounting() {
         signal: 0,
         run_attempt: 0,
         at: None,
+        launch_detail: None,
     });
     for op in &ops {
         leader.apply_operation(op);

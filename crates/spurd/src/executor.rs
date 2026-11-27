@@ -31,6 +31,8 @@ pub enum LaunchError {
     /// The node itself cannot host work: an I/O failure in spurd's own spool
     /// tree, so every subsequent job will fail identically.
     NodeFault(anyhow::Error),
+    /// Raised after the workload was spawned, so the script may already have run.
+    AfterSpawn(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -42,12 +44,16 @@ impl std::fmt::Display for LaunchError {
         match self {
             Self::PrologFailed(e) => write!(f, "prolog failed: {e:#}"),
             Self::NodeFault(e) => write!(f, "launch failed: {e:#}"),
-            Self::Other(e) => write!(f, "{e:#}"),
+            Self::AfterSpawn(e) | Self::Other(e) => write!(f, "{e:#}"),
         }
     }
 }
 
 impl LaunchError {
+    pub fn workload_spawned(&self) -> bool {
+        matches!(self, Self::AfterSpawn(_))
+    }
+
     /// Reason for the agent to drain itself, or `None` when the controller owns
     /// the decision. A prolog failure drains too, but the controller does it,
     /// because only the controller can pair the drain with the hold that stops
@@ -55,7 +61,7 @@ impl LaunchError {
     pub fn drain_reason(&self) -> Option<String> {
         match self {
             Self::NodeFault(_) => Some(self.to_string()),
-            Self::PrologFailed(_) | Self::Other(_) => None,
+            Self::PrologFailed(_) | Self::AfterSpawn(_) | Self::Other(_) => None,
         }
     }
 }
@@ -1075,20 +1081,7 @@ async fn spawn_job_process(
         // Drop the slave fd immediately so the master gets EOF when the child exits.
         let pty_master = job_io.into_master();
 
-        // The child joined its own cgroup pre-exec; confirm it landed so `required`
-        // can refuse a job that would otherwise run outside every limit.
-        if cfg.cgroup.required {
-            if let (Some(cgroup), Some(pid)) = (cgroup_path.path(), child.id()) {
-                if !cgroup_has_pid(cgroup, pid) {
-                    // Reaps as well as kills, so the guard finds the cgroup empty.
-                    let _ = child.kill().await;
-                    return Err(anyhow::anyhow!(
-                        "[cgroup] required but the job did not join its cgroup"
-                    )
-                    .into());
-                }
-            }
-        }
+        refuse_unjoined_workload(cfg.cgroup.required, cgroup_path.path(), &mut child).await?;
 
         debug!(
             job_id,
@@ -1118,6 +1111,26 @@ async fn spawn_job_process(
         }
     }
     launched
+}
+
+/// The child joined its own cgroup pre-exec; confirm it landed so `required`
+/// can refuse a job that would otherwise run outside every limit.
+pub(crate) async fn refuse_unjoined_workload(
+    required: bool,
+    cgroup: Option<&Path>,
+    child: &mut tokio::process::Child,
+) -> Result<(), LaunchError> {
+    let (true, Some(cgroup), Some(pid)) = (required, cgroup, child.id()) else {
+        return Ok(());
+    };
+    if cgroup_has_pid(cgroup, pid) {
+        return Ok(());
+    }
+    // Reaps as well as kills, so the guard finds the cgroup empty.
+    let _ = child.kill().await;
+    Err(LaunchError::AfterSpawn(anyhow::anyhow!(
+        "[cgroup] required but the job did not join its cgroup"
+    )))
 }
 
 /// Render a job's cgroup-v2 control files as (filename, content) pairs. Pure so
@@ -2634,7 +2647,7 @@ async fn launch_container_job(
     env: &HashMap<String, String>,
     job_io: JobIo,
     cgroup_path: &CgroupGuard,
-) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
+) -> Result<(RunningJob, Option<OwnedFd>), LaunchError> {
     let job_id = cfg.job_id;
 
     // Sync pipe: child writes status, parent reads.
@@ -2800,7 +2813,9 @@ async fn launch_container_job(
 
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
-                bail!("container init failed for job {}: {}", job_id, msg);
+                return Err(
+                    anyhow::anyhow!("container init failed for job {}: {}", job_id, msg).into(),
+                );
             }
 
             // Only now is the child's self-join guaranteed to have run. Verify
@@ -2814,7 +2829,9 @@ async fn launch_container_job(
                     // Reap before returning: the guard's rmdir races an exit
                     // that has been signalled but not yet completed.
                     let _ = nix::sys::wait::waitpid(child, None);
-                    anyhow::bail!("[cgroup] required but the container did not join its cgroup");
+                    return Err(LaunchError::AfterSpawn(anyhow::anyhow!(
+                        "[cgroup] required but the container did not join its cgroup"
+                    )));
                 }
             }
 
@@ -4391,7 +4408,10 @@ mod tests {
         ) {
             Ok(_) => panic!("a name past NAME_MAX cannot be created"),
             Err(
-                LaunchError::Other(e) | LaunchError::NodeFault(e) | LaunchError::PrologFailed(e),
+                LaunchError::Other(e)
+                | LaunchError::NodeFault(e)
+                | LaunchError::PrologFailed(e)
+                | LaunchError::AfterSpawn(e),
             ) => e,
         };
         assert!(

@@ -172,6 +172,7 @@ async fn a_job_in_its_kill_wait_charges_the_partition_qos_until_its_node_reports
         signal: 15,
         at: None,
         run_attempt: 0,
+        launch_detail: None,
     });
     assert!(schedulable(&cm, third).is_some());
 }
