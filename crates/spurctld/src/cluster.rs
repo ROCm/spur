@@ -324,6 +324,12 @@ pub(crate) fn raises_time_limit(
     matches!((current, requested), (Some(current), Some(requested)) if requested > current)
 }
 
+fn time_limit_raise_refused(job_id: JobId) -> JobUpdateRefusal {
+    JobUpdateRefusal::PermissionDenied(format!(
+        "only an operator can raise the time limit of job {job_id}"
+    ))
+}
+
 fn exclude_after_placement(job_id: JobId) -> JobUpdateRefusal {
     JobUpdateRefusal::FailedPrecondition(format!(
         "job {job_id} already has nodes reserved: excluded nodes can only be changed before placement"
@@ -5277,10 +5283,7 @@ impl ClusterManager {
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if !may_raise_time_limit && raises_time_limit(job.spec.time_limit, time_limit) {
-                return Err(JobUpdateRefusal::PermissionDenied(format!(
-                    "only an operator can raise the time limit of job {job_id}"
-                ))
-                .into());
+                return Err(time_limit_raise_refused(job_id).into());
             }
             (
                 job.spec.user.clone(),
@@ -5410,26 +5413,55 @@ impl ClusterManager {
             })?;
         }
 
-        // Non-WAL-tracked fields: update directly
-        let mut jobs = self.jobs.write();
-        if let Some(job) = jobs.get_mut(&job_id) {
-            if let Some(tl) = time_limit {
-                job.spec.time_limit = Some(tl);
-            }
-            if let Some(part) = partition {
-                job.spec.partition = Some(part);
-            }
-            if let Some(c) = comment {
-                job.spec.comment = Some(c);
-            }
-            if let Some(a) = account {
-                job.spec.account = Some(a);
-            }
-            if let Some(q) = qos {
-                job.spec.qos = Some(q);
-            }
-        }
+        self.apply_unlogged_job_fields(
+            job_id,
+            time_limit,
+            partition,
+            comment,
+            account,
+            qos,
+            may_raise_time_limit,
+        )?;
         info!(job_id, "job updated");
+        Ok(())
+    }
+
+    /// Writes the fields that are not replicated. The raise rule is checked again under the
+    /// write lock: the check at the top of `update_job` ran before the proposals above, and
+    /// an admin may have shortened the limit since.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_unlogged_job_fields(
+        &self,
+        job_id: JobId,
+        time_limit: Option<chrono::Duration>,
+        partition: Option<String>,
+        comment: Option<String>,
+        account: Option<String>,
+        qos: Option<String>,
+        may_raise_time_limit: bool,
+    ) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        if !may_raise_time_limit && raises_time_limit(job.spec.time_limit, time_limit) {
+            return Err(time_limit_raise_refused(job_id).into());
+        }
+        if let Some(tl) = time_limit {
+            job.spec.time_limit = Some(tl);
+        }
+        if let Some(part) = partition {
+            job.spec.partition = Some(part);
+        }
+        if let Some(c) = comment {
+            job.spec.comment = Some(c);
+        }
+        if let Some(a) = account {
+            job.spec.account = Some(a);
+        }
+        if let Some(q) = qos {
+            job.spec.qos = Some(q);
+        }
         Ok(())
     }
 
@@ -37450,6 +37482,85 @@ state = "UP"
             cm.get_job(id).unwrap().spec.time_limit,
             Some(chrono::Duration::minutes(60))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_limit_shortened_after_the_first_check_is_not_lengthened_by_the_write() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("tl-race"));
+        let minutes = chrono::Duration::minutes;
+        cm.update_job(
+            id,
+            Some(minutes(60)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        // The request below shortens 60 to 30, so the first check lets it through. An admin
+        // then cuts the limit to 10 before the write, which makes the request a raise.
+        cm.update_job(
+            id,
+            Some(minutes(10)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let err = cm
+            .apply_unlogged_job_fields(id, Some(minutes(30)), None, None, None, None, false)
+            .expect_err("the write must see the admin's shorter limit");
+
+        assert!(matches!(
+            err.downcast_ref::<JobUpdateRefusal>(),
+            Some(JobUpdateRefusal::PermissionDenied(_))
+        ));
+        assert_eq!(cm.get_job(id).unwrap().spec.time_limit, Some(minutes(10)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_write_applies_a_shorter_limit_and_the_other_fields() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("tl-write"));
+        let minutes = chrono::Duration::minutes;
+        cm.update_job(
+            id,
+            Some(minutes(60)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        cm.apply_unlogged_job_fields(
+            id,
+            Some(minutes(30)),
+            None,
+            Some("note".into()),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.time_limit, Some(minutes(30)));
+        assert_eq!(job.spec.comment.as_deref(), Some("note"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
