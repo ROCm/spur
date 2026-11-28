@@ -2390,6 +2390,8 @@ impl SlurmController for ControllerService {
                     ("priority", req.priority.map(Into::into)),
                     ("comment", req.comment.clone().map(Into::into)),
                     ("exclude", req.exclude.clone().map(Into::into)),
+                    ("time_limit", req.time_limit.map(|d| d.seconds.into())),
+                    ("qos", req.qos.clone().map(Into::into)),
                 ]),
             )
             .asserted_actor(&req.user),
@@ -2430,16 +2432,15 @@ impl SlurmController for ControllerService {
         // Same ceiling as submit: a non-privileged caller cannot raise priority above the cap
         // post-submit. UpdateJob returns Empty, so there is no response field to carry a warning —
         // log it instead, so a clamp on this path is at least observable.
-        if let Some(w) = Self::clamp_priority(
+        let priority_warning = Self::clamp_priority(
             &mut req.priority,
             caller_is_privileged,
             self.cluster.config().scheduler.max_user_priority,
-        ) {
-            warn!(job_id = req.job_id, "{w}");
-        }
+        );
 
         let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
-
+        let may_raise_time_limit =
+            caller_is_privileged || self.caller_is_operator(__identity.as_ref());
         self.cluster
             .update_job(
                 req.job_id,
@@ -2450,9 +2451,13 @@ impl SlurmController for ControllerService {
                 req.account,
                 req.qos,
                 req.exclude,
+                may_raise_time_limit,
             )
             .map_err(update_job_err_to_status)?;
 
+        if let Some(w) = priority_warning {
+            warn!(job_id = req.job_id, "{w}");
+        }
         Ok(Response::new(()))
     }
 
@@ -7025,6 +7030,7 @@ fn update_job_err_to_status(err: anyhow::Error) -> Status {
         Some(crate::cluster::JobUpdateRefusal::FailedPrecondition(m)) => {
             Status::failed_precondition(m)
         }
+        Some(crate::cluster::JobUpdateRefusal::PermissionDenied(m)) => Status::permission_denied(m),
         None => Status::internal(err.to_string()),
     }
 }
@@ -15131,6 +15137,158 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_longer_finite_limit_counts_as_a_raise() {
+        let mins = |m| Some(chrono::Duration::minutes(m));
+        use crate::cluster::raises_time_limit;
+        assert!(raises_time_limit(mins(60), mins(61)));
+        assert!(!raises_time_limit(mins(60), mins(60)));
+        assert!(!raises_time_limit(mins(60), mins(30)));
+        assert!(!raises_time_limit(None, mins(30)));
+        assert!(!raises_time_limit(mins(60), None));
+    }
+
+    async fn job_with_time_limit(svc: &ControllerService, owner: &str, minutes: i64) -> u32 {
+        let job_id = running_job_owned_by(svc, owner).await;
+        svc.cluster
+            .update_job(
+                job_id,
+                Some(chrono::Duration::minutes(minutes)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        job_id
+    }
+
+    fn time_limit_update(
+        job_id: u32,
+        minutes: i64,
+        as_user: &str,
+        is_admin: bool,
+    ) -> Request<UpdateJobRequest> {
+        let mut req = Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: minutes * 60,
+                nanos: 0,
+            }),
+            user: as_user.into(),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(spur_core::auth::Identity {
+            user: as_user.into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin,
+            trusted_unix: false,
+        });
+        req
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_cannot_raise_their_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        let err = svc
+            .update_job(time_limit_update(job_id, 2880, "ubuntu", false))
+            .await
+            .expect_err("an owner must not lengthen their own job's limit");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(60))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_can_shorten_their_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(time_limit_update(job_id, 30, "ubuntu", false))
+            .await
+            .expect("an owner may shorten their own job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(30))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_can_raise_a_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(time_limit_update(job_id, 120, "root", true))
+            .await
+            .expect("an admin may lengthen any job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_who_does_not_own_the_job_can_raise_its_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("dave", "Operator");
+
+        let mut req = time_limit_update(job_id, 120, "dave", false);
+        req.extensions_mut().insert(viewer("dave", false));
+        svc.update_job(req)
+            .await
+            .expect("an operator may lengthen a job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
+        );
+    }
+
+    /// Without a credential the caller is trusted as before (`permissive` mode), so an anonymous
+    /// request naming the owner may lengthen the limit. This pins that, so a change to
+    /// `caller_is_privileged` is a deliberate one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_anonymous_caller_naming_the_owner_can_raise_the_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: 120 * 60,
+                nanos: 0,
+            }),
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an anonymous caller is trusted in permissive mode");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
+        );
+    }
+
     /// The owner check must key off the *authenticated* identity, not the
     /// wire-asserted `user`: a caller cannot spoof the owner's name to slip past
     /// the gate. `authoritative_user` overwrites the field before the check.
@@ -19218,6 +19376,10 @@ mod tests {
             (
                 anyhow::Error::from(JobUpdateRefusal::InvalidArgument("bad list".into())),
                 Code::InvalidArgument,
+            ),
+            (
+                anyhow::Error::from(JobUpdateRefusal::PermissionDenied("operator only".into())),
+                Code::PermissionDenied,
             ),
             (anyhow::anyhow!("raft write failed"), Code::Internal),
         ];
