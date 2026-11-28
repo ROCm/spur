@@ -828,9 +828,11 @@ applied over it.
    Jobs already running when this behaviour arrives keep the unbounded limit they
    were submitted with; the QOS cap applies to submissions from then on. To bound
    an existing job, set its limit directly with
-   ``scontrol update JobId=<id> TimeLimit=<time>``. Only an operator or
-   administrator can lengthen a limit this way, so an owner cannot run past the
-   cap the QOS gave their job at submit.
+   ``scontrol update JobId=<id> TimeLimit=<time>``. With ``[auth] mode =
+   "required"``, only an operator or administrator can lengthen a limit this way,
+   so an owner cannot run past the cap the QOS gave their job at submit. Under the
+   default ``permissive`` mode, a request with no credential is trusted as before
+   and can lengthen it.
 
 .. _limits-unreadable:
 

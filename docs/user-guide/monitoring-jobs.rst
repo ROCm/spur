@@ -1596,8 +1596,9 @@ so the resources become usable within about 40 seconds.
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled
-``ExcludedNodes=``). As in Slurm, a job's owner can shorten its ``TimeLimit=``
-but only an operator or administrator can lengthen it. Node updates need
+``ExcludedNodes=``). A job's owner can shorten its ``TimeLimit=``, but only an
+operator or administrator can lengthen it. Under the default ``permissive`` auth
+mode, a request with no credential is trusted and can lengthen it. Node updates need
 ``NodeName=`` and accept ``State=`` and ``Reason=``.
 
 ``ExcNodeList=`` takes a hostlist expression and replaces the job's excluded

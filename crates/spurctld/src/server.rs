@@ -1255,15 +1255,6 @@ impl ControllerService {
         reservation_manager_ruling(user, privileged)
     }
 
-    /// As in Slurm, a job's owner may shorten its time limit but only an operator may lengthen it;
-    /// otherwise an owner could run past the QOS `MaxWall` their limit was capped to at submit.
-    fn raises_time_limit(
-        current: Option<chrono::Duration>,
-        requested: Option<chrono::Duration>,
-    ) -> bool {
-        matches!((current, requested), (Some(current), Some(requested)) if requested > current)
-    }
-
     /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`, mirroring
     /// Slurm's operator-only priority raising (an ordinary user may only lower it). Clamped down, not
     /// rejected, so a fat-fingered `--priority` still runs. Privileged callers and an unset priority
@@ -2148,6 +2139,8 @@ impl SlurmController for ControllerService {
                     ("priority", req.priority.map(Into::into)),
                     ("comment", req.comment.clone().map(Into::into)),
                     ("exclude", req.exclude.clone().map(Into::into)),
+                    ("time_limit", req.time_limit.map(|d| d.seconds.into())),
+                    ("qos", req.qos.clone().map(Into::into)),
                 ]),
             )
             .asserted_actor(&req.user),
@@ -2188,23 +2181,15 @@ impl SlurmController for ControllerService {
         // Same ceiling as submit: a non-privileged caller cannot raise priority above the cap
         // post-submit. UpdateJob returns Empty, so there is no response field to carry a warning —
         // log it instead, so a clamp on this path is at least observable.
-        if let Some(w) = Self::clamp_priority(
+        let priority_warning = Self::clamp_priority(
             &mut req.priority,
             caller_is_privileged,
             self.cluster.config().scheduler.max_user_priority,
-        ) {
-            warn!(job_id = req.job_id, "{w}");
-        }
+        );
 
         let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
-        let may_raise = caller_is_privileged || self.caller_is_operator(__identity.as_ref());
-        if !may_raise && Self::raises_time_limit(job.spec.time_limit, time_limit) {
-            return Err(Status::permission_denied(format!(
-                "only an operator can raise the time limit of job {}",
-                req.job_id
-            )));
-        }
-
+        let may_raise_time_limit =
+            caller_is_privileged || self.caller_is_operator(__identity.as_ref());
         self.cluster
             .update_job(
                 req.job_id,
@@ -2215,9 +2200,13 @@ impl SlurmController for ControllerService {
                 req.account,
                 req.qos,
                 req.exclude,
+                may_raise_time_limit,
             )
             .map_err(update_job_err_to_status)?;
 
+        if let Some(w) = priority_warning {
+            warn!(job_id = req.job_id, "{w}");
+        }
         Ok(Response::new(()))
     }
 
@@ -6761,6 +6750,7 @@ fn update_job_err_to_status(err: anyhow::Error) -> Status {
         Some(crate::cluster::JobUpdateRefusal::FailedPrecondition(m)) => {
             Status::failed_precondition(m)
         }
+        Some(crate::cluster::JobUpdateRefusal::PermissionDenied(m)) => Status::permission_denied(m),
         None => Status::internal(err.to_string()),
     }
 }
@@ -14424,11 +14414,12 @@ mod tests {
     #[test]
     fn only_a_longer_finite_limit_counts_as_a_raise() {
         let mins = |m| Some(chrono::Duration::minutes(m));
-        assert!(ControllerService::raises_time_limit(mins(60), mins(61)));
-        assert!(!ControllerService::raises_time_limit(mins(60), mins(60)));
-        assert!(!ControllerService::raises_time_limit(mins(60), mins(30)));
-        assert!(!ControllerService::raises_time_limit(None, mins(30)));
-        assert!(!ControllerService::raises_time_limit(mins(60), None));
+        use crate::cluster::raises_time_limit;
+        assert!(raises_time_limit(mins(60), mins(61)));
+        assert!(!raises_time_limit(mins(60), mins(60)));
+        assert!(!raises_time_limit(mins(60), mins(30)));
+        assert!(!raises_time_limit(None, mins(30)));
+        assert!(!raises_time_limit(mins(60), None));
     }
 
     async fn job_with_time_limit(svc: &ControllerService, owner: &str, minutes: i64) -> u32 {
@@ -14443,6 +14434,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .unwrap();
         job_id
@@ -14516,6 +14508,54 @@ mod tests {
         svc.update_job(time_limit_update(job_id, 120, "root", true))
             .await
             .expect("an admin may lengthen any job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_who_does_not_own_the_job_can_raise_its_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("dave", "Operator");
+
+        let mut req = time_limit_update(job_id, 120, "dave", false);
+        req.extensions_mut().insert(viewer("dave", false));
+        svc.update_job(req)
+            .await
+            .expect("an operator may lengthen a job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
+        );
+    }
+
+    /// Without a credential the caller is trusted as before (`permissive` mode), so an anonymous
+    /// request naming the owner may lengthen the limit. This pins that, so a change to
+    /// `caller_is_privileged` is a deliberate one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_anonymous_caller_naming_the_owner_can_raise_the_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: 120 * 60,
+                nanos: 0,
+            }),
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an anonymous caller is trusted in permissive mode");
 
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().spec.time_limit,
@@ -18426,6 +18466,10 @@ mod tests {
             (
                 anyhow::Error::from(JobUpdateRefusal::InvalidArgument("bad list".into())),
                 Code::InvalidArgument,
+            ),
+            (
+                anyhow::Error::from(JobUpdateRefusal::PermissionDenied("operator only".into())),
+                Code::PermissionDenied,
             ),
             (anyhow::anyhow!("raft write failed"), Code::Internal),
         ];
